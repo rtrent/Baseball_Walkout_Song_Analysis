@@ -1,0 +1,767 @@
+---
+title: "Baseball Walkout Song Analysis"
+date: "`r format(Sys.time(), '%B %d %Y')`"
+output: html_document
+---
+```{r warning = FALSE, include=FALSE}
+##Loading data
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(ggridges)
+library(knitr)
+library(kableExtra)
+
+options(stringsAsFactors=FALSE)
+setwd("data") #this sets the working directory to our data folder just for this section
+
+#importing the scraped data that I got with python and beautiful soup
+files <- list.files(pattern ="_baseball.csv")
+player_songs_df <- data_frame()
+
+for (x in 1:length(files)) {
+  infile <- read.csv(files[x])
+  player_songs_df <- bind_rows(player_songs_df, infile)
+  #print(paste("Added", files[x])) #print statement can be useful to keep track of which files loaded
+}
+rm(infile)
+rm(x)
+rm(files)
+
+#removing extra columns from the csv
+player_songs_df <- select(player_songs_df, -X)
+```
+
+```{r warning = FALSE, include=FALSE}
+
+##Cleaning walkout song data
+
+#Data issues
+# * Many songs linked to Spotify you can play them. These songs were formatted differently than those without links.
+# * Some teams had different formatting (e.g. strong or bold) for no clear reason.
+# * Some players are listed multiple times and next to each appearance there was a note (e.g. first at bat).
+# * Some players were listed, but their walkout song field was just left blank.
+
+# added because the twins randomly have bolding, so the splitter doesnt work here
+# need to do this before I can split it
+player_songs_df$song <- sub('<b>', '', player_songs_df$song, perl = TRUE) 
+player_songs_df$song <- sub('<\\/b>', '', player_songs_df$song, perl = TRUE) 
+
+# on the pirates some randomly have stong tag
+player_songs_df$song <- sub('<\\/strong>', '', player_songs_df$song, perl = TRUE) 
+player_songs_df$song <- sub('<strong>', '', player_songs_df$song, perl = TRUE) 
+
+# there is a span tag between artist and song tags across all cases
+# this is a general solve because the spotify linked songs and the just text named songs 
+# have different tags so it's not a very clean split
+player_songs_df <- player_songs_df%>%
+  separate(song, c('artist', 'title'), '</span>', remove = TRUE, extra = "drop")
+
+# cleaning up the extra html around all the song and artist names
+player_songs_df$artist <- sub('<.*>', '', player_songs_df$artist)
+player_songs_df$title <- sub('<.*>', '', player_songs_df$title)
+
+# some players have '(first at bat)' or something on their names, this gets rid of all that
+player_songs_df$player_name <- sub(' \\([f/s/t].*', '', player_songs_df$player_name, perl = TRUE)
+player_songs_df$player_name <- sub(' - [First/Second].*', '', player_songs_df$player_name, perl = TRUE)
+
+# remove "pitching" and "batting" from clayton kershaw's name
+player_songs_df$player_name <- sub(' \\(Pitching\\)', '', player_songs_df$player_name, perl = FALSE)
+player_songs_df$player_name <- sub(' \\(Batting\\)', '', player_songs_df$player_name, perl = FALSE)
+
+# remove players that have no music
+player_songs_df <- player_songs_df %>% 
+  filter(!is.na(title))
+
+#need to fix these as well so merging together works later
+player_songs_df$artist <- gsub("&amp;", "&", player_songs_df$artist)
+player_songs_df$title <- gsub("&amp;", "&", player_songs_df$title)
+
+# uncomment this in order to save the list of player names
+
+# this will be used later to scrape stats for each player
+# player_songs_df %>%
+#   select(player_name) %>%
+#   unique() %>%
+#   write.csv("r_output/player_names.csv", row.names = FALSE)
+
+# this will be used to scrape genre info about songs
+# player_songs_df %>%
+#   select(artist) %>%
+#   unique() %>%
+#   write.csv("r_output/music.csv", row.names = FALSE)
+
+
+# Removed players
+# As you can see from the error, some of the players had no walkout song data. These players did not have info listed on # MBL website. We could do some extra searching and find more information, but for the purposes of our analysis we will # drop them. This removed 57 players, so overall it is not a huge amount.
+
+
+# ##Getting genres for songs
+
+# Next, I needed to get the genres for each song since ultimately I wanted to find a relationship between genres and # player performance.
+
+# I used the Last.fm API which allows users to pull tags for songs or artists. Tags are categories assigned and upvoted by users of the website. They are note exactly genres and they can be very specific, but very often they match with commonly accepted genres.
+
+# ##Cleaning genre data
+
+# Data problems:
+# * The tags were not generic genres like rock, country, rap, but were as specific as "groove metal", "hard rock", and "singer-songwriter".
+# * Some artists did not return any tags (which could have happened for a few reasons) and right now are listed as "error". I needed to manually put these in later.
+
+# #combining sub-genres:
+# Clearly kind of messy. Addressing the first issue, I took some of the most common subgenres that were appearing and lumped them into more general categories. The groups I formed were rock, hip hop, country, christian, latin, electronic, and pop.
+
+# ~need to make a table of tags to final genres...
+
+# Other data cleaning:
+# There was also a little bit of cleaning I had to do here. For example, Last.fm users clearly don't like J. Balvin because his highest upvoted tag is "mierda" or shit.
+
+music_df <- read.csv('data/artist_tags.csv',
+                  col.names = c("index", "artist", "tag1", "tag2", "tag3"))
+
+music_df <- select(music_df, -index)
+
+music_df <- mutate(music_df, genre_rock = grepl("rock|metal|indie|punk", c(music_df$tag1), ignore.case = TRUE) |
+                  grepl("rock|metal|indie|punk", c(music_df$tag2), ignore.case = TRUE) |
+                  grepl("rock|metal|indie|punk", c(music_df$tag3), ignore.case = TRUE))
+
+music_df <- mutate(music_df, genre_hiphop = grepl("hip-hop|rap", c(music_df$tag1), ignore.case = TRUE) | 
+                  grepl("hip-hop|rap", c(music_df$tag2), ignore.case = TRUE) | 
+                  grepl("hip-hop|rap", c(music_df$tag3), ignore.case = TRUE))
+
+music_df <- mutate(music_df, genre_country = grepl("country", c(music_df$tag1), ignore.case = TRUE) | 
+                  grepl("country", c(music_df$tag2), ignore.case = TRUE) | 
+                  grepl("country", c(music_df$tag3), ignore.case = TRUE))
+
+music_df <- mutate(music_df, genre_christian = grepl("christian", c(music_df$tag1), ignore.case = TRUE) | 
+                  grepl("christian", c(music_df$tag2), ignore.case = TRUE) | 
+                  grepl("christian", c(music_df$tag3), ignore.case = TRUE))
+
+music_df <- mutate(music_df, genre_reggae = grepl("reggae", c(music_df$tag1), ignore.case = TRUE) | 
+                  grepl("reggae", c(music_df$tag2), ignore.case = TRUE) | 
+                  grepl("reggae", c(music_df$tag3), ignore.case = TRUE))
+
+#latin is more complicated as it include reggeton, salsa, etc
+#j balvin needs to be manually set to latin since the tags are all vandalism
+music_df <- mutate(music_df, genre_latin = grepl("latin|reggaeton|salsa|merengue", c(music_df$tag1), ignore.case = TRUE) | 
+                  grepl("latin|reggaeton|salsa|merengue", c(music_df$tag2), ignore.case = TRUE) | 
+                  grepl("latin|reggaeton|salsa|merengue", c(music_df$tag3), ignore.case = TRUE))
+
+music_df <- mutate(music_df, genre_electronic = grepl("electronic|dance|house|chill", c(music_df$tag1), ignore.case = TRUE) | 
+                  grepl("electronic|dance|house|chill", c(music_df$tag2), ignore.case = TRUE) | 
+                  grepl("electronic|dance|house|chill", c(music_df$tag3), ignore.case = TRUE))
+
+
+music_df <- mutate(music_df, genre_pop = grepl("pop|rnb", c(music_df$tag1), ignore.case = TRUE) | 
+                  grepl("pop|rnb", c(music_df$tag2), ignore.case = TRUE) | 
+                  grepl("pop|rnb", c(music_df$tag3), ignore.case = TRUE))
+
+
+music_df <- music_df %>%
+  mutate(genre = if_else(genre_electronic == TRUE, "Electronic",
+                         if_else(genre_christian== TRUE, "Christian",
+                                 if_else(genre_country== TRUE, "Country",
+                                         if_else(genre_rock== TRUE, "Rock",
+                                                 if_else(genre_latin== TRUE, "Latin",
+                                                         if_else(genre_reggae==TRUE, "Reggae",
+                                                                 if_else(genre_pop== TRUE, "Pop",
+                                                                         if_else(genre_hiphop== TRUE, "Hiphop", "")))))))))
+
+#cleaning bad tags and typos
+music_df <- music_df %>%
+  mutate(genre = if_else(artist == "J Balvin", "Latin", genre))
+
+music_df <- music_df %>%
+  mutate(genre = if_else(artist == "Drake", "Hiphop", genre))
+
+music_df <- music_df %>%
+  mutate(genre = if_else(artist == "Nicky Jam", "Latin", genre))
+
+
+# For the second issue, there was a number of songs that still needed genres. Since it was not too many songs, I look a manual approach. I searched for each song on youtube and made a judgement  of the genre. A lot of these songs were latin pop (possibly not on Last.fm) or songs with features listed in the artist name (complicated searching with the API).
+
+
+# After finalizing I loaded these back into R and merged the data. After this I had a genre for each song.
+
+music_df <- player_songs_df %>%
+  select(artist, title) %>%
+  left_join(music_df, by = "artist")
+
+missing_song <- read.csv("data/need_genre_populated.csv")
+
+#need to fix these as well so merging together works later
+missing_song$artist <- gsub("&amp;", "&", missing_song$artist)
+missing_song$song <- gsub("&amp;", "&", missing_song$song)
+
+music_df <- left_join(music_df, missing_song, by = c('artist' = 'artist', 'title' = 'song'))
+
+#I had two genre columns, one from my manual input and one from the programatic assignment
+#for all rows only one was populated and the other was blank
+music_df <- mutate(music_df, genre_final = if_else(genre.x == "", genre.y, genre.x)) 
+
+
+#selecting only the columns we need (i.e. getting rid of all the tags)
+music_df <- rename(music_df, genre = genre_final) #renaming columns
+tags <- music_df
+
+music_df <- select(music_df, c('artist', 'title', 'genre'))
+
+head(music_df)
+which(is.na(music_df$genre) == TRUE)
+#Hardcoding some missing genres because i am too lazy to update the spreadsheet
+music_df[182,3] <- 'Electronic'
+music_df[204,3] <- 'Latin'
+music_df[815,3] <- 'Rock'
+
+#write.csv(music_df, 'music_df.csv')
+
+```
+
+
+```{r include = FALSE}
+# Merging Players and Songs
+player_music_df <- left_join(player_songs_df, music_df, by = c("artist", "title"))
+player_music_df <- unique(player_music_df)
+
+# Combining data with player stats
+
+batting_stats <- read.csv(file = 'data/player_stats.csv', 
+                          col.names = c("index", "player_name", "position", "team_full", "ops", "hr", "slg", "obp", "rbi", "at_bat", "pitches"))
+batting_stats <- select(batting_stats, -index)
+
+
+pitching_stats <- read.csv(file = 'data/player_stats_pitching.csv', col.names = c("index", "player_name", "position", "team_full", "era", "whip", "so", "ip", "np"))
+pitching_stats <- select(pitching_stats, -index)
+
+player_info <- read.csv(file = 'data/player_info.csv', col.names = c("index", "player_name", "position", "team_full", "birth_country", "bat_hand", "throw_hand", "birth_date", "weight", "height"))
+player_info <- select(player_info, -index)
+#OMG height is just the inches over the foot which they are... so i need height feet as well... useless
+
+
+player_df <- full_join(player_info, batting_stats, by = c("player_name", "position", "team_full"))
+player_df <- full_join(player_df, pitching_stats, by = c("player_name", "position", "team_full"))
+
+
+player_music_df <- left_join(player_df, player_music_df, by = "player_name")
+
+
+### Correcting data types
+#Some stats were loaded in as text so changing those to numeric
+#Changing genre and team to a factor
+
+
+#str(player_music_df)
+player_music_df$team_full <- as.factor(player_music_df$team_full)
+player_music_df$genre <- as.factor(player_music_df$genre)
+player_music_df$slg <- as.numeric(player_music_df$slg)
+player_music_df$obp <- as.numeric(player_music_df$obp)
+#str(player_music_df)
+
+#write.csv(player_music_df, 'player_music_df.csv')
+
+
+
+```
+At this point, it’s cliche to say that watching a baseball game on TV is nothing like the in-person experience. But it’s a common refrain because it’s true. 
+
+To me, a key, but underrated, element that makes watching live more engaging is the sound of the stadium. It's a mess of bats, cheering, PA announcements and music. A very intentional and orchestrated part of buzz is the walkout song for each player, a tradition you can trace back to a 1970’s Chicago White Sox [organist](https://www.nbcwashington.com/news/sports/Baseball-Walk-Up-Music--144150975.html) and a 1990’s Philadelphia Phillies [PR person](https://abcnews.go.com/Sports/mlb-walk-music-designated-hit/story?id=33437245).
+
+Baseball walkout songs are each individually picked by the players. That is so unique for a major league sport and given the number of players in baseball, provides lots of data points for patters to emerge. I wanted to analyze the walkout music of the MLB 2018 regular season to answer a few questions.
+
+* First, what are the overall musical trends?
+* Next, when digging deeper, are there big differences when comparing teams or positions?
+* Finally, a bit of a stretch but, is there any connection between performance and musical tastes?
+
+Data was compiled from the [MLB website](https://www.mlb.com/entertainment/walk-up) (walkout songs), the [MLB stats API](https://appac.github.io/mlb-data-api-docs/) (hitting/pitching stats), and the [Last.FM API](https://www.last.fm/api) (artist genres). I used R for the analysis (check out my [GitHub](https://github.com/rtrent/Baseball_Walkout_Song_Analysis) for more deets).
+
+##Overall Music Trends
+
+To start with my first question, I've broken down the walkout music by genre, artist, and song.
+
+###Walkout Song Genres
+```{r echo=FALSE}
+##Summarizing the song data
+
+###Top Genres Table
+music_genres <- music_df %>%
+  group_by(genre) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n))
+
+music_genres$genre <- factor(music_genres$genre, levels = c("Hiphop", "Rock", "Latin", "Country", "Electronic", "Pop", 
+                                                            "Christian", "Oldies", "Reggae", "Other"))
+
+###Top Genre Bar Chart
+
+# a color palette for the graphs
+cbPalette <- c("#9999CC", "#E69F00", "#56B4E9", "#009E73", "#CCCC00", "#0072B2", "#D55E00", "#CC79A7", "#CC6666", "#999999")
+
+ggplot(data = music_genres, aes(x = genre, y = n)) +
+  geom_bar(stat= "identity", aes(fill = genre)) +
+  geom_text(aes(label = n), vjust = -.5) +
+  scale_x_discrete(limits = music_genres$genre) + 
+  scale_fill_manual(values=cbPalette) +
+  guides(fill=FALSE) +
+  labs(x = "Genre", y = "Number of Walkout Songs")
+
+# ggsave("WalkoutSongGenre.jpeg", plot = last_plot(), device = "jpeg")
+
+``` 
+
+```{r include = FALSE}
+#count artist function
+count_artist_features <- function(artist) {
+    artist_count = sum((grepl(artist, music_df$title) == TRUE), 
+        (grepl(artist, music_df$artist) == TRUE))
+    return(artist_count)
+}
+```
+
+###Top Artists For Walkout Songs
+```{r echo = FALSE}
+##Top Artists including features Chart
+
+top_music_artists <- music_df %>% group_by(artist, genre) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n)) %>%
+  head (25)
+
+#dim(top_music_artists$artist)
+top_music_artists$n <- apply(top_music_artists[,1], 1, count_artist_features)
+#subtracking one from drake because we know from above he has an extra counted for him
+top_music_artists[1,3] <- (top_music_artists[1,3] - 1)
+
+top_music_artists <- top_music_artists %>%
+  arrange(desc(n))
+
+top_music_artists %>% select(-genre) %>% 
+  kable(col.names = c("Artist", "Number of Songs")) %>%
+  kable_styling(full_width = F, position = "c", bootstrap_options= c("striped"))
+```
+
+###Top Walkout Songs
+```{r echo = FALSE}
+##Top Songs Table
+
+top_music_songs <- music_df %>% group_by(title, artist, genre) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n)) %>%
+  filter(n >= 3)
+
+select(top_music_songs, title, artist, n) %>% kable(col.names = c("Title", "Artist", "Number")) %>%
+  kable_styling(full_width = F, position = "c", bootstrap_options= c("striped"))
+```
+
+At a macro level, genres seem to be aligned with current musical tastes - the prominence of hip hop and the rise of Latin rap/pop - but looking at artists and songs, there are several bands part of the older generation of rock stars - Led Zeppelin and AC/DC. The latter at this point are staples in any stadium rotation looking to energize fans.
+
+Drake is the most popular artist (nearly 5% of the total songs!) which is aligned with the 2018 Billboard rankings for artists (he's #1). Other artists popular in 2018 also on our list include Cardi B, Bad Bunny, and Migos. Other eras are getting representation as well. 90’s artists with Tupac and Biggie are top picks. And I don't know why, but the 2000’s are represented by Audioslave.
+
+The weirdest walkout songs I found were: The [SpongeBob SquarePants theme](https://www.youtube.com/watch?v=r9L4AseD-aA) and what was called "Ric Flair Theme" (the walkout song for wrestler Ric Flair), also known as ["Also Sprach Zarathustra, Op. 30 (Obertura)](https://www.youtube.com/watch?v=dfe8tCcHnKY)", composed by Richard Strauss.
+
+##Deep Dive by Team and Position
+
+Within each position or team, I expect there to be some interesting variations, but I'm not sure what we will see. Next, I have the team breakdowns.
+
+###Walkout Song Genres by Team
+```{r echo = FALSE}
+###Team Totals For Later Analyses
+#totals of team including doubles
+
+music_genres$genre <- factor(music_genres$genre, levels = c("Hiphop", "Rock", "Latin", "Country", "Electronic", "Pop", 
+                                                            "Christian", "Oldies", "Reggae", "Other"))
+
+
+team_totals <- player_music_df %>%
+  select(player_name, team_full, genre) %>%
+  unique() %>%
+  group_by(team_full) %>%
+  summarize(Total=n())
+
+#Genres by each team
+team_genres <- player_music_df %>%
+  select(player_name, team_full, genre) %>%
+  unique() %>%
+  group_by(team_full, genre) %>%
+  summarize(n=n()) %>%
+  spread(genre, n, 0) %>%
+  left_join(team_totals, by = "team_full")
+  
+team_genres[,2:12] <- round(team_genres[,2:12] / team_genres$Total * 100,1)
+  
+team_genres <- as.data.frame(team_genres)
+
+
+###this looks wrong in notebook but right in knitr
+team_genres[,c(1, 5, 11, 6, 3, 4, 9, 2, 7, 10, 8)] %>%
+  kable(col.names = c("Team", "Hip-hop", "Rock", "Latin", "Country",
+                               "Electronic", "Pop", "Christian", "Oldies", "Reggae", "Other")) %>%
+  kable_styling(bootstrap_options= c("striped")) %>%
+  add_header_above(c(" " = 1, "Genre" = 10)) %>%
+  scroll_box(width = "100%", height = "25%")
+
+ 
+```
+  
+This first chart is a bit unwieldy. It's a little to large to get a sense of the whole all at once, but it's good for referencing specifics. I've also created a visual representation below. This has it's own limitations, but should be easier for spotting trends.
+
+###Walkout Song Genres by Team - Stacked Bar Chart
+```{r echo = FALSE}
+###Bar Chart Visualizing Genre By Team
+
+my_order <- c("Hiphop", "Rock", "Latin", "Country", "Electronic", "Pop", "Christian", "Oldies", "Reggae", "Other")
+
+
+team_genres %>%
+  select(-Total) %>%
+  gather(key = genre, n, 2:11) %>%
+  mutate(genre = factor(genre, levels = my_order)) %>%
+  mutate(team_full = factor(team_full, levels = rev(levels(team_full)))) %>%
+  ggplot(aes(x = team_full, y = n)) + 
+    geom_bar(stat = 'identity', position = 'stack', aes(fill = genre)) +
+    coord_flip() +
+    scale_fill_manual(values=cbPalette)
+```
+
+Some of the more interesting things I can see from this are:
+
+* The New York Yankees are the most hip-hop team
+* The San Francisco Giants are the least hip-hop, but also the most rock
+* The Texas Rangers have zero players that use rock music (suprising since its the overall #2 genre), but also the most country
+* Boston is the most electronic
+* Philly is the most Christian
+* The Padres are the most reggae
+
+Overall there are not any apparent trends. I do see somewhat of a divide between the coasts and the center of the country when it comes to country music. These patterns are obviously noisey because players don't necessarily hail from the city/region where they play. But even if an individual player has different tastes, at the team level it seems the culture of the city does seem to break through.
+
+Next, the breakdown by field position.
+
+###Walkout Song Genres by Position Played
+```{r echo = FALSE}
+
+###Totals for each position
+#Including duplicates for players with different genres
+
+position_totals <- player_music_df %>%
+  select(player_name, position, genre) %>%
+  unique() %>%
+  group_by(position) %>%
+  summarize(Total=n())
+
+#position by Genre
+
+position_genres <- player_music_df %>%
+  select(player_name, position, genre) %>%
+  unique() %>%
+  group_by(position, genre) %>%
+  summarize(n=n()) %>%
+  spread(genre, n, 0) %>%
+  left_join(position_totals, by = "position")
+
+position_genres[,2:12] <- round(position_genres[,2:12] / position_genres$Total * 100, 1)
+  
+position_genres <- as.data.frame(position_genres)
+
+###this looks wrong in notebook but right in knitr
+
+
+position_genres[,c(1, 5, 11, 6, 3, 4, 9, 2, 7, 10, 8)] %>%
+  filter(!(position %in% c("DH", "OF"))) %>%
+  kable(col.names = c("Position", "Hip-hop", "Rock", "Latin", "Country",
+                              "Electronic", "Pop", "Christian", "Oldies", "Reggae", "Other")) %>%
+  kable_styling(bootstrap_options= c("striped")) %>%
+  add_header_above(c(" " = 1, "Genre" = 10))
+
+
+```
+  `
+This table is easier to digest than the previous one, but I've added another visual to help make differences more apparent.
+
+###Walkout Song Genres by Position Played - Clustered Bar Chart
+```{r echo = FALSE, error= FALSE}
+###Bar Char Visualizing Genre By Position
+#Should drop DH and OF
+
+my_order <- c("Hiphop", "Rock", "Latin", "Country", "Electronic", "Pop", "Christian", "Oldies", "Reggae", "Other")
+
+cbPalette <- c("#9999CC", "#E69F00", "#56B4E9", "#009E73", "#CCCC00", "#0072B2", "#D55E00", "#CC79A7", "#CC6666", "#999999")
+position_genres %>%
+  select(-Total) %>%
+  gather(key = genre, n, 2:11) %>%
+  filter(!(position %in% c("DH", "OF"))) %>%
+  mutate(genre = factor(genre, levels = my_order)) %>%
+  ggplot(aes(x = position, y = n)) + 
+    geom_bar(stat = 'identity', position = 'dodge', aes(fill = genre)) +
+    labs(fill = "Genre", y = "Proportion of Players (%)", x = "Position") + 
+    scale_fill_manual(values=cbPalette)
+  
+```
+
+Here I see some more curious trends. They're interesting, but there is no clear explanation for why.
+
+* Left Fielders are the most hip-hop
+* Pitchers are the most rock by a sizable margin
+* Shortstops are the most Latin
+* Christian is sprinkled throughout, but it's 5x more prevelent in Center Field than the other two outfielders
+* Right Field has no country (and overall country is much lower for the outfield than infield)
+
+I'm not sure what to do with this information regarding differences by position. It's interesting, but nothing more than that. There is one trend that I can  offer a partial explanation for. The prominence of Latin music with shortstops may be because half of the sample is made up of players born in Latin America.
+
+##Relationship Between Performance and Music
+
+Finally, the final and most speculative question of this analysis. Could there be any kind of link between music and performance? Since this is not set up as a randomized experiment, we could never say that the music *caused* any of this performance. We can test to see if theres a relationship between the two that can't just be explained by randomness.
+
+I'm analyzing four statistics, two for batting and two for pitching. In each case I've picked a more complicated one and something more tangible.
+
+* Batting
+  + On Base Percentage Plus Slugging (OPS) - The addition of On Base Percentage (the proportion of at-bats a player is on base) and Slugging Percentage (the average number of bases a player gets each at-bat) - the higher the better
+  + Home Runs (HR) - a more straightforward way to judge a batter - home runs are good, so the more the better
+* Pitching
+  + Walks and Hits Per Inning Pitched (WHIP) - How often a pitcher allows a player to get on base - the lower the batter
+  + Strike Outs - More straight forward for pitching - strike outs are the best outcome for a pitcher, so the more the better
+
+OPS and WHIP are a bit complicated, but modern baseball analysts consider these the gold standard batting and pitching stats to evaluate players on. 
+
+For my interpretation, I've created a visual representation of each distribution by genre. Following that I've run an ANOVA test to determine if any of the relationships are statistically significant. ANOVA will not tell us which genre is significantly higer or lower, just that the relationship overall is not explainable by chance alone. It does this by comparing variance of each sub-group to the variance of the data overall.
+
+I've removed the less frequent genres, oldies, reggae and other since there are too few observations to draw meaningful conclusions about their distributions (i.e. it may mess up our statistical analysis). Small group sizes also don't work very well with ANOVA.
+
+###On Base Plus Slugging (OPS) Distribution by Genre
+```{r echo = FALSE, message = FALSE}
+
+my_order <- c("Hiphop", "Rock", "Latin", "Country", "Electronic", "Pop", "Christian", "Oldies", "Reggae", "Other")
+cbPalette <- c("#9999CC", "#E69F00", "#56B4E9", "#009E73", "#CCCC00", "#0072B2", "#D55E00")
+
+player_music_df %>%
+  select(player_name, ops, at_bat, genre) %>%
+  unique() %>%
+  filter(ops > 0, at_bat > 10, !(genre %in% c("Reggae", "Oldies", "Other"))) %>%
+  mutate(genre = factor(genre, levels = rev(my_order))) %>%
+  ggplot(aes(y=genre, x = ops)) +
+    geom_density_ridges(aes(fill = genre), alpha = 0.5) +
+    #geom_vline(aes(xintercept=mean(ops)), linetype="dashed", 
+    #            color = "black", size=.3) +
+    theme(axis.text.y = element_text(vjust = -2.5)) +
+    xlim(0,1.5) +
+    scale_fill_manual(values=rev(cbPalette))+
+    labs(y = "Genre", x = "OPS") + 
+    guides(fill=FALSE)
+
+```
+
+###Home Run Distributin by Genre
+```{r echo = FALSE, message = FALSE}
+my_order <- c("Hiphop", "Rock", "Latin", "Country", "Electronic", "Pop", "Christian", "Oldies", "Reggae", "Other")
+cbPalette <- c("#9999CC", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00")
+
+
+player_music_df %>%
+  filter(ops > 0, at_bat > 10, !(genre %in% c("Reggae", "Oldies", "Other"))) %>%
+  mutate(genre = factor(genre, levels = rev(my_order))) %>%
+  ggplot(aes(y=genre, x = hr)) +
+    geom_density_ridges(aes(fill = genre), alpha = 0.5) +
+    #geom_vline(aes(xintercept=mean(hr)), linetype="dashed", 
+    #            color = "black", size=.3) +
+    xlim(0,50) +
+    theme(axis.text.y = element_text(vjust = -2.5)) +
+    scale_fill_manual(values=rev(cbPalette))+
+    labs(y = "Genre", x = "Home Runs") + 
+    guides(fill=FALSE)
+```
+
+
+###Walks and Hits per Inning Pitched (WHIP) Distribution by Genre
+```{r echo = FALSE, message = FALSE}
+
+my_order <- c("Hiphop", "Rock", "Latin", "Country", "Electronic", "Pop", "Christian", "Oldies", "Reggae", "Other")
+cbPalette <- c("#9999CC", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00")
+
+
+player_music_df %>%
+  select(player_name, position, whip, genre, ip) %>%
+  mutate(genre = factor(genre, levels = rev(my_order))) %>%
+  filter(position == "P", !(genre %in% c("Reggae", "Oldies", "Other"))) %>%
+  unique() %>%
+  filter(whip > 0, ip > 9) %>%
+  ggplot(aes(y=genre, x = whip)) +
+    geom_density_ridges(aes(fill = genre), alpha = .5) +
+    #geom_vline(aes(xintercept=mean(whip)), linetype="dashed", 
+    #            color = "black", size=.3) +
+    xlim(.5,2.5) +
+    theme(axis.text.y = element_text(vjust = -2.5)) +
+    scale_fill_manual(values=rev(cbPalette))+
+    labs(y = "Genre", x = "WHIP") + 
+    guides(fill=FALSE)
+```
+
+###Strike Out Distribution by Genre
+```{r echo = FALSE, message = FALSE, warning = FALSE}
+my_order <- c("Hiphop", "Rock", "Latin", "Country", "Electronic", "Pop", "Christian", "Oldies", "Reggae", "Other")
+cbPalette <- c("#9999CC", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00")
+
+player_music_df %>%
+  select(player_name, position, so, genre, ip) %>%
+  mutate(genre = factor(genre, levels = rev(my_order))) %>%
+  filter(position == "P", !(genre %in% c("Reggae", "Oldies", "Other"))) %>%
+  unique() %>%
+  filter(so > 0, ip > 9) %>%
+  ggplot(aes(y=genre, x = so)) +
+    geom_density_ridges(aes(fill = genre), alpha = .5) +
+    #geom_vline(aes(xintercept=mean(so)), linetype="dashed", 
+    #            color = "black", size=.3) +
+    xlim(0,250) +
+    theme(axis.text.y = element_text(vjust = -2.5)) +
+    scale_fill_manual(values=rev(cbPalette))+
+    labs(y = "Genre", x = "Strike Outs") + 
+    guides(fill=FALSE)
+```
+
+From these visuals, OPS and WHIP seem very consistent across genres. I would not suspect there was any relationship there. For HR and SO though, there is some difference. Pop and Electronic seem to have more of the distribution area on the right. Country also has a thicker right tail. It's important to note though that these genres have smaller samples sizes, so that may be playing a role in the distribution we are seeing.
+
+To confirm the suspicion that there are no relationships present, we can turn to statistical tools available in R. As previously stated, I'm using ANOVA testing. For reference, I've just made a table of each stats mean and standard deviation by genre. These two summary statistics are the components of the ANOVA test. The R function I've run will automatically provide a p value which we can interpret.
+
+###Summary Table and ANOVA Tests for Stats+Genre Relationship
+```{r echo = FALSE}
+ops_hr_table <- player_music_df %>%
+  select(player_name, genre, ops, hr, whip, so, at_bat, ip, position) %>%
+  unique() %>%
+  filter(!is.na(ops), ops > 0, at_bat > 10, !(genre %in% c("Other", "Oldies", "Reggae"))) %>%
+  group_by(genre) %>%
+  summarise(avg_ops = round(mean(ops),2), std_ops = round(sd(ops),2), avg_hr= round(mean(hr),2), std_hr = round(sd(hr),2))
+  
+whip_so_table <- player_music_df %>%
+  select(player_name, genre, ops, hr, whip, so, at_bat, ip, position) %>%
+  unique() %>%
+  filter(position == "P", !is.na(whip), whip > 0, ip > 9, !(genre %in% c("Other", "Oldies", "Reggae"))) %>%
+  group_by(genre) %>%
+  summarise(avg_whip = round(mean(whip),2), std_whip = round(sd(whip),2), avg_so = round(mean(so),2), std_so = round(sd(so),2))
+
+full_join(ops_hr_table, whip_so_table, by = "genre") %>%
+  kable(col.names = c("Genre", "Mean", "StDev", "Mean", "StDev", "Mean", "StDev", "Mean", "StDev")) %>%
+  kable_styling(full_width = F, position = "c", bootstrap_options= c("striped")) %>%
+  add_header_above(c(" " = 1, "OPS" = 2, "HR" = 2, "WHIP" = 2, "SO" = 2))
+
+
+
+```
+
+```{r include = FALSE}
+player_music_df %>%
+  select(player_name, genre, ops, hr, whip, so, at_bat, ip) %>%
+  unique() %>%
+  filter(!is.na(ops), ops > 0, at_bat > 10, !(genre %in% c("Other", "Oldies", "Reggae"))) %>%
+  group_by(genre) %>%
+  summarise(avg_ops = round(mean(ops),2), med_ops = round(median(ops),2), std_ops = round(sd(ops),2)) %>%
+  kable(col.names = c("Genre", "Average", "Median", "Standard Dev")) %>%
+  kable_styling(full_width = F, position = "c") %>%
+  add_header_above(c(" " = 1, "OPS" = 3))
+```
+###ANOVA: Genre vs OPS
+```{r echo = FALSE}
+###Statistical testing 
+#Using ANOVA to see if there is link between stat and genre
+#If stat sig then we can say the distribution is not what we would expect if it were randomops_ftest_data <- 
+
+ops_ftest_data <- player_music_df %>%
+  select(player_name, genre, ops, hr, whip, so, at_bat, ip) %>%
+  unique() %>%
+  filter(!is.na(ops), ops > 0, at_bat > 10, !(genre %in% c("Other", "Oldies", "Reggae"))) %>%
+  select(-player_name)
+
+ops_aov <- aov(ops~genre, data = ops_ftest_data)
+summary(ops_aov)
+```
+
+```{r include = FALSE}
+player_music_df %>%
+  select(player_name, genre, ops, hr, whip, so, at_bat, ip) %>%
+  unique() %>%
+  filter(!is.na(ops), ops > 0, at_bat > 10, !(genre %in% c("Other", "Oldies", "Reggae"))) %>%
+  group_by(genre) %>%
+  summarise(avg_hr = round(mean(hr),2), med_hr = round(median(hr),2), std_hr = round(sd(hr),2)) %>%
+  kable(col.names = c("Genre", "Average", "Median", "Standard Dev")) %>%
+  kable_styling(full_width = F, position = "c") %>%
+  add_header_above(c(" " = 1, "HR" = 3))
+```
+
+###ANOVA: Genre vs HR
+```{r echo = FALSE}
+hr_ftest_data <- player_music_df %>%
+  select(player_name, genre, ops, hr, whip, so, at_bat, ip) %>%
+  unique() %>%
+  filter(!is.na(ops), ops > 0, at_bat > 10, !(genre %in% c("Other", "Oldies", "Reggae"))) %>%
+  select(-player_name)
+
+hr_aov <- aov(hr~genre, data = hr_ftest_data)
+summary(hr_aov)
+
+```
+```{r include = FALSE}
+player_music_df %>%
+  select(player_name, genre, ops, hr, whip, so, at_bat, ip, position) %>%
+  unique() %>%
+  filter(position == "P", whip > 0 , ip > 9) %>%
+  filter(!(genre %in% c("Other", "Oldies", "Reggae"))) %>%
+  group_by(genre) %>%
+  summarise(avg_whip = round(mean(whip),2), med_whip = round(median(whip),2), std_whip = round(sd(whip),2)) %>%
+  kable(col.names = c("Genre", "Average", "Median", "Standard Dev")) %>%
+  kable_styling(full_width = F, position = "c") %>%
+  add_header_above(c(" " = 1, "WHIP" = 3))
+
+```
+
+###ANOVA: Genre vs WHIP
+```{r echo = FALSE}
+
+whip_ftest_data <- player_music_df %>%
+  filter(position == "P", whip > 0 , ip > 9) %>%
+  select(player_name, genre, whip) %>%
+  unique() %>%
+  filter(!(genre %in% c("Other", "Oldies", "Reggae"))) %>%
+  select(-player_name)
+
+whip_aov <- aov(whip~genre, data = whip_ftest_data)
+summary(whip_aov)
+
+
+```
+```{r include = FALSE}
+player_music_df %>%
+  select(player_name, genre, ops, hr, whip, so, at_bat, ip, position) %>%
+  unique() %>%
+  filter(position == "P", whip > 0 , ip > 9) %>%
+  filter(!(genre %in% c("Other", "Oldies", "Reggae"))) %>%
+  group_by(genre) %>%
+  summarise(avg_so = round(mean(so),2), med_so = round(median(so),2), std_so = round(sd(so),2)) %>%
+  kable(col.names = c("Genre", "Average", "Median", "Standard Dev")) %>%
+  kable_styling(full_width = F, position = "c") %>%
+  add_header_above(c(" " = 1, "SO" = 3))
+```
+###ANOVA: Genre vs SO
+```{r echo = FALSE}
+so_ftest_data <- player_music_df %>%
+  filter(position == "P", whip > 0 , ip > 9) %>%
+  select(player_name, genre, so) %>%
+  unique() %>%
+  filter(!(genre %in% c("Other", "Oldies", "Reggae"))) %>%
+  select(-player_name)
+
+so_aov <- aov(so~genre, data = so_ftest_data)
+summary(so_aov)
+
+```
+
+Well, this was an excessive amount of calculation to conclude that none of the relationships are significant. Strike outs came the closest, which makes sense looking at our visualization again.
+
+At this point, I have to reject my hypothesis there was any relationship between a players genre of walkout song and their performance. Despite not getting any evidence for my idea, this exercise was really interesting and, as the scientific community agrees, it's important to publish [negative results](https://www.nature.com/articles/d41586-017-07325-2).
+
+##Conclusion
+
+The highlights of the groundbreaking analysis I've brought you today:
+
+* Hip-hop and Drake are really popular, but so are modern and classic rock bands. 
+* The Giants don't like hip-hop, but not as much as the Rangers don't like rock.
+* Pitchers like rock and shortstops like Latin music, but don't even think about playing country for outfielders.
+* There is no relationship between the genre of a player's walkout song and their performance (batting or pitching).
+
+To close, I will share my hypothetical [walkout song](https://www.youtube.com/watch?v=vuyxX5P5Xug).
